@@ -1,0 +1,7 @@
+.git
+target
+data
+uploads
+backups
+.env
+.env.*
