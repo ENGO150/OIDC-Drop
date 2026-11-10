@@ -1,6 +1,6 @@
 services:
   oidc-drop:
-    build: .
+    image: ghcr.io/engo150/oidc-drop:latest
     restart: unless-stopped
     container_name: oidc-drop
     # With rootless Docker, container root maps to the host daemon user.

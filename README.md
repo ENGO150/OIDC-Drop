@@ -8,7 +8,8 @@ A separate web server such as Caddy serves the finished downloads.
 
 ## Docker setup
 
-You need Docker with Compose and a checkout of this repository.
+You need Docker with Compose, a checkout of this repository, and a published
+image accessible from the deployment host.
 
 1. Copy the example configuration:
 
@@ -43,13 +44,14 @@ You need Docker with Compose and a checkout of this repository.
 
    ```sh
    docker compose config --quiet
-   docker compose up -d --build
+   docker compose pull
+   docker compose up -d
    curl -i http://127.0.0.1:8080/healthz
    ```
 
    The health endpoint returns `204 No Content`. View logs with
-   `docker compose logs -f oidc-drop`. After source updates, run
-   `docker compose up -d --build` again.
+   `docker compose logs -f oidc-drop`. To update to the latest published image,
+   run `docker compose pull` followed by `docker compose up -d` again.
 
 Compose reads `.env` automatically. It requires all four variables in the
 example. The audience (`oidc-drop`), listen address and upload limit are set
@@ -136,8 +138,8 @@ and publishes `ghcr.io/<owner>/<repository>:main` and `:latest` (lowercase).
 It uses GitHub-hosted runners and the automatic `GITHUB_TOKEN`; no custom secret
 is required. GitHub Actions must be enabled and allowed to publish packages.
 
-Compose builds locally by default. To use the published image, replace `build: .`
-with `image: ghcr.io/engo150/oidc-drop:latest` (adjust for forks), then run:
+Compose uses `ghcr.io/engo150/oidc-drop:latest` by default (adjust for forks).
+To download the latest image and start or update the service, run:
 
 ```sh
 docker compose pull
@@ -146,6 +148,9 @@ docker compose up -d
 
 The image must already be published and accessible to the deployment host.
 Private packages require registry authentication.
+
+To build locally instead, replace `image: ghcr.io/engo150/oidc-drop:latest` with
+`build: .` and run `docker compose up -d --build`.
 
 ## Running without Docker
 
