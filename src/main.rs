@@ -2,8 +2,10 @@ mod consts;
 
 use std::
 {
-    fs,
+    io,
+    env,
     sync::Arc,
+    fs::{ self, File },
     net::SocketAddr,
     collections::{ HashMap, HashSet },
     time::{ Duration, Instant },
@@ -11,6 +13,20 @@ use std::
     {
         PathBuf,
         Path as FsPath,
+    },
+};
+
+use tokio::
+{
+    task,
+    signal,
+    net::TcpListener,
+    io::AsyncWriteExt,
+    sync::Mutex,
+    fs::
+    {
+        self as afs,
+        File as AFile,
     },
 };
 
@@ -23,24 +39,18 @@ use axum::
     routing,
 };
 
-use futures_util::stream::StreamExt;
-
 use jsonwebtoken::
 {
-    jwk,
+    Algorithm,
     DecodingKey,
     Validation,
+    jwk::JwkSet,
 };
 
 use serde::Deserialize;
 use sha2::{ Digest, Sha256 };
-
-use tokio::
-{
-    fs as afs,
-    io::AsyncWriteExt,
-    sync::Mutex,
-};
+use futures_util::stream::StreamExt;
+use reqwest::{ Client, Response };
 
 struct Config
 {
@@ -63,7 +73,7 @@ struct Keys
 struct App
 {
     config: Config,
-    http: reqwest::Client,
+    http: Client,
     keys: Mutex<Keys>,
     seen_jti: Mutex<HashMap<String, Instant>>,
 }
@@ -81,7 +91,7 @@ type Fail = (StatusCode, &'static str);
 
 fn env_var(name: &str) -> String
 {
-    std::env::var(name).unwrap_or_else(|_| panic!("missing environment variable {name}"))
+    env::var(name).unwrap_or_else(|_| panic!("missing environment variable {name}"))
 }
 
 fn env_set(name: &str) -> HashSet<String>
@@ -107,8 +117,7 @@ fn env_map(name: &str) -> HashMap<String, String>
                 .unwrap_or_else(|| panic!("{name} entry {pair:?} is not id=prefix"));
 
             (id.trim().to_owned(), prefix.trim().to_owned())
-        })
-        .collect()
+        }).collect()
 }
 
 impl App
@@ -131,12 +140,12 @@ impl App
             return Err((StatusCode::UNAUTHORIZED, "unknown key id"));
         }
 
-        let set: jwk::JwkSet = self
+        let set: JwkSet = self
             .http
             .get(consts::JWKS_URL)
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
+            .and_then(Response::error_for_status)
             .map_err(|_| (StatusCode::BAD_GATEWAY, "cannot reach the issuer"))?
             .json()
             .await
@@ -187,10 +196,8 @@ impl App
             .ok_or((StatusCode::UNAUTHORIZED, "token has no key id"))?;
         let key = self.key_for(&kid).await?;
 
-        // Algorithm, audience, issuer and expiry are all checked here; anything
-        // left to the body below is a claim jsonwebtoken does not know about.
         let mut validation = Validation::new(header.alg);
-        validation.algorithms = vec![jsonwebtoken::Algorithm::RS256];
+        validation.algorithms = vec![Algorithm::RS256];
         validation.set_audience(&[&self.config.audience]);
         validation.set_issuer(&[consts::ISSUER]);
         validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
@@ -200,15 +207,11 @@ impl App
             .map_err(|_| (StatusCode::UNAUTHORIZED, "token rejected"))?
             .claims;
 
-        // The numeric ids are the identity that survives a rename: `repository`
-        // is a name somebody else could claim if a repo were ever deleted.
         if claims.repository_owner_id != self.config.repository_owner_id
         {
             return Err((StatusCode::FORBIDDEN, "wrong owner"));
         }
 
-        // Which project this is, and therefore what its files are called, is the
-        // token's to say and never the request's.
         let prefix = self
             .config
             .prefixes
@@ -216,8 +219,6 @@ impl App
             .cloned()
             .ok_or((StatusCode::FORBIDDEN, "wrong repository"))?;
 
-        // Pins the workflow to an exact branch: a run on any other ref, on a
-        // pull request or in a fork carries a different `sub`.
         if !self.config.allowed_subs.contains(&claims.sub)
         {
             return Err((StatusCode::FORBIDDEN, "subject not allowed"));
@@ -231,11 +232,8 @@ impl App
             .map(|(_, b)| b.to_owned())
             .ok_or((StatusCode::FORBIDDEN, "subject carries no branch"))?;
 
-        // A branch reaches a filename, so it may only be the characters a
-        // filename should hold — no separators, no leading dot.
-        if branch.is_empty()
-            || branch.starts_with('.')
-            || !branch.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        if branch.is_empty() || branch.starts_with('.') ||
+            !branch.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
         {
             return Err((StatusCode::FORBIDDEN, "unusable branch name"));
         }
@@ -254,9 +252,6 @@ async fn upload
 {
     let (prefix, branch) = app.authenticate(&headers).await?;
 
-    // The destination is never built out of caller-supplied text: the variant
-    // comes from a fixed list and the branch from the verified token, so there
-    // is no path to traverse out of.
     if !app.config.allowed_variants.contains(&variant)
     {
         return Err((StatusCode::BAD_REQUEST, "unknown variant"));
@@ -276,8 +271,6 @@ async fn upload
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "cannot open the data directory"))?;
 
-    // The body goes to disk as it arrives and is never held whole: a desktop
-    // bundle is hundreds of megabytes and the container is capped far below that.
     let temp_path = dir.join(format!(".{asset}.incoming"));
     let received = receive(&temp_path, body, app.config.max_bytes).await;
 
@@ -300,7 +293,7 @@ async fn upload
     let name = asset.clone();
     let digest = actual.clone();
 
-    tokio::task::spawn_blocking(move || publish_atomically(&dir, &name, &digest))
+    task::spawn_blocking(move || publish_atomically(&dir, &name, &digest))
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "write task failed"))?
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "write failed"))?;
@@ -312,7 +305,7 @@ async fn upload
 
 async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result<(u64, String), Fail>
 {
-    let mut file = afs::File::create(path)
+    let mut file = AFile::create(path)
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "cannot open the temporary file"))?;
 
@@ -345,22 +338,20 @@ async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result<(u64, Stri
     Ok((size, hex::encode(hasher.finalize())))
 }
 
-fn publish_atomically(dir: &FsPath, name: &str, digest: &str) -> std::io::Result<()>
+fn publish_atomically(dir: &FsPath, name: &str, digest: &str) -> io::Result<()>
 {
     let final_path = dir.join(name);
     let temp_path = dir.join(format!(".{name}.incoming"));
 
     fs::rename(&temp_path, &final_path)?;
 
-    // Publish the digest beside the binary so downloads can be checked.
     let sums_path = dir.join(format!("{name}.sha256"));
     let temp_sums = dir.join(format!(".{name}.sha256.incoming"));
 
     fs::write(&temp_sums, format!("{digest}  {name}\n"))?;
     fs::rename(&temp_sums, &sums_path)?;
 
-    // Durability of the directory entries themselves.
-    fs::File::open(dir)?.sync_all()
+    File::open(dir)?.sync_all()
 }
 
 async fn healthz() -> StatusCode
@@ -380,7 +371,7 @@ async fn main()
         prefixes: env_map("ASSET_PREFIXES"),
         allowed_subs: env_set("ALLOWED_SUBS"),
         allowed_variants: env_set("ALLOWED_VARIANTS"),
-        max_bytes: std::env::var("MAX_UPLOAD_BYTES")
+        max_bytes: env::var("MAX_UPLOAD_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(256 * 1024 * 1024),
@@ -391,7 +382,7 @@ async fn main()
     let app = Arc::new(App
     {
         config,
-        http: reqwest::Client::builder()
+        http: Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("cannot build an HTTP client"),
@@ -404,7 +395,7 @@ async fn main()
         .route("/healthz", routing::get(healthz))
         .with_state(app);
 
-    let listener = tokio::net::TcpListener::bind(listen)
+    let listener = TcpListener::bind(listen)
         .await
         .expect("cannot bind the listener");
 
@@ -412,6 +403,6 @@ async fn main()
 
     axum::serve(listener, router).with_graceful_shutdown(async
     {
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = signal::ctrl_c().await;
     }).await.expect("server failed");
 }
