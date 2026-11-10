@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = "0.8.9"
-futures-util = "0.3.34"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+futures-util = { version = "0.3", default-features = false }
 hex = "0.4.3"
 jsonwebtoken = "11.1.0"
-reqwest = "0.13.5"
-serde = "1.0.229"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
-tokio = "1.54.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util"] }
