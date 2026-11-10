@@ -1,12 +1,3 @@
-//! Minimal upload endpoint authenticated by GitHub Actions OIDC tokens.
-//!
-//! No standing secret: every request carries a short-lived JWT minted by the
-//! workflow run, verified against GitHub's JWKS and pinned to a set of
-//! repositories and a list of branches. The request names only the variant it
-//! is uploading (`client-linux`); the prefix comes from the token's repository
-//! and the branch from its ref, and the three are composed into
-//! DATA_DIR/<prefix>-<branch>-<variant>.
-
 use std::
 {
     fs,
@@ -51,10 +42,7 @@ use tokio::
 
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
 const JWKS_URL: &str = "https://token.actions.githubusercontent.com/.well-known/jwks";
-/// Refuse to refetch the key set more often than this, so an unknown `kid` is
-/// not a lever for making us hammer GitHub.
 const JWKS_MIN_REFRESH: Duration = Duration::from_secs(300);
-/// A `jti` is remembered at least this long, comfortably past any token's exp.
 const JTI_TTL: Duration = Duration::from_secs(30 * 60);
 
 struct Config
@@ -63,7 +51,6 @@ struct Config
     data_dir: PathBuf,
     audience: String,
     repository_owner_id: String,
-    /// Repository id -> asset prefix. Doubles as the repository allowlist.
     prefixes: HashMap<String, String>,
     allowed_subs: HashSet<String>,
     allowed_variants: HashSet<String>,
@@ -110,8 +97,6 @@ fn env_set(name: &str) -> HashSet<String>
         .collect()
 }
 
-/// Parses `id=prefix` pairs. The id side is what a token is matched against,
-/// so a typo here is a repository that cannot publish rather than one that can.
 fn env_map(name: &str) -> HashMap<String, String>
 {
     env_var(name)
@@ -131,8 +116,6 @@ fn env_map(name: &str) -> HashMap<String, String>
 
 impl App
 {
-    /// Return the verification key for `kid`, refetching the key set once if it
-    /// is unknown and the cooldown has passed (GitHub rotates its signing keys).
     async fn key_for(&self, kid: &str) -> Result<DecodingKey, Fail>
     {
         let mut keys = self.keys.lock().await;
@@ -179,8 +162,6 @@ impl App
             .ok_or((StatusCode::UNAUTHORIZED, "unknown key id"))
     }
 
-    /// Reject a token whose `jti` we have already accepted, so a token captured
-    /// in transit cannot be replayed inside its (short) validity window.
     async fn claim_jti(&self, jti: &str) -> Result<(), Fail>
     {
         let mut seen = self.seen_jti.lock().await;
@@ -195,8 +176,6 @@ impl App
         Ok(())
     }
 
-    /// Verify the bearer token and return the asset prefix of the repository it
-    /// was minted in, with the branch it was minted on.
     async fn authenticate(&self, headers: &HeaderMap) -> Result<(String, String), Fail>
     {
         let token = headers
@@ -334,11 +313,6 @@ async fn upload
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Stream the body into `path`, hashing and counting on the way through.
-///
-/// The cap is enforced here rather than by a body-limit layer, which only
-/// applies to an extractor that collects the whole body — the thing being
-/// avoided.
 async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result<(u64, String), Fail>
 {
     let mut file = afs::File::create(path)
@@ -374,8 +348,6 @@ async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result<(u64, Stri
     Ok((size, hex::encode(hasher.finalize())))
 }
 
-/// Move the received file into place, so a download that arrives mid-upload
-/// sees the previous binary rather than half of the new one.
 fn publish_atomically(dir: &FsPath, name: &str, digest: &str) -> std::io::Result<()>
 {
     let final_path = dir.join(name);
