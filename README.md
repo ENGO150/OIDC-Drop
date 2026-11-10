@@ -131,6 +131,135 @@ The default maximum **complete file size** is 256 MiB, including chunked uploads
 Increase `MAX_UPLOAD_BYTES` in Compose if needed. Any proxy must also allow each
 individual request body.
 
+## Example GitHub upload workflow
+
+Save this as `.github/workflows/publish.yml` in the repository producing your
+artifacts. Set its repository Actions variable `DL_ENDPOINT` to
+`https://your-download-domain/upload`. Replace the build command and
+`target/release/myapp` with your actual build and file path.
+
+Match `AUDIENCE` to the server's `OIDC_AUDIENCE`, allow the repository and `main`
+branch in the server configuration, and include `linux-amd64` in
+`ALLOWED_VARIANTS`. No custom token secret is needed.
+
+The example splits the file into 64 MiB pieces and uploads them in order. Each
+request attempt mints a fresh token; completion also uses its own token.
+
+```yaml
+name: Publish artifact
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Upload in chunks
+        env:
+          ENDPOINT: ${{ vars.DL_ENDPOINT }}
+          AUDIENCE: oidc-drop
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ACTIONS_ID_TOKEN_REQUEST_{URL,TOKEN} ARE INJECTED BY `id-token: write`.
+          # A FRESH TOKEN PER REQUEST: THE ENDPOINT ACCEPTS EACH `jti` EXACTLY ONCE.
+          #
+          # THE ANSWER IS PARSED SEPARATELY RATHER THAN PIPED STRAIGHT INTO jq: UNDER
+          # `pipefail` A NON-JSON ANSWER MAKES jq EXIT NON-ZERO, WHICH KILLED THE
+          # WHOLE STEP FROM INSIDE THE RETRY LOOP THAT WAS MEANT TO SURVIVE IT
+          mint() {
+            local answer token
+
+            answer="$(curl -sS --fail-with-body \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")" || return 1
+
+            token="$(printf '%s' "$answer" | jq -r '.value // empty' 2>/dev/null)" || return 1
+            [ -n "$token" ] || return 1
+
+            printf '%s' "$token"
+          }
+
+          # EVERY CHUNK AND COMPLETION RETRY NEEDS A FRESH SINGLE-USE TOKEN.
+          upload_request() {
+            local file="$1" url="$2" sum="$3" size="$4" chunk_sum="$5"
+            local token attempt status response
+            response="$(mktemp)"
+            for attempt in 1 2 3 4; do
+              status=""
+              if token="$(mint)"; then
+                echo "::add-mask::$token"
+                if status="$(curl -sS --fail-with-body --output "$response" \
+                     --write-out '%{http_code}' \
+                     -X PUT "$url" \
+                     -H "Authorization: Bearer $token" \
+                     -H "X-Content-SHA256: $sum" \
+                     -H "X-Upload-Size: $size" \
+                     -H "X-Chunk-SHA256: $chunk_sum" \
+                     --data-binary "@$file")"; then
+                  rm -f "$response"
+                  return 0
+                fi
+                cat "$response" >&2
+              else
+                echo "could not mint an upload token" >&2
+              fi
+              # A SIZE LIMIT IS PERMANENT; RETRYING THE SAME BODY CANNOT FIX IT.
+              if [ "$status" = 413 ] || [ "$attempt" -eq 4 ]; then
+                echo "upload failed: $url (HTTP ${status:-unknown})" >&2
+                rm -f "$response"
+                return 1
+              fi
+              sleep $((attempt * 15))
+            done
+          }
+
+          publish() {
+            local file="$1" variant="$2" sum size chunks chunk chunk_sum index=0
+            sum="$(sha256sum "$file" | cut -d' ' -f1)"
+            size="$(stat -c '%s' "$file")"
+            chunks="$(mktemp -d)"
+            # 64 MiB PER REQUEST, INCLUDING THE LAST PART, LEAVES HEADROOM BELOW
+            # CLOUDFLARE'S 100 MB LIMIT. HTTP TRANSFER CHUNKING ALONE WOULD NOT.
+            if ! split -b 67108864 -d -a 6 -- "$file" "$chunks/part-"; then
+              rm -rf "$chunks"
+              return 1
+            fi
+            for chunk in "$chunks"/part-*; do
+              chunk_sum="$(sha256sum "$chunk" | cut -d' ' -f1)"
+              echo "uploading $variant chunk $index ($size bytes total)"
+              if ! upload_request "$chunk" "${ENDPOINT%/}/$variant/chunks/$index" "$sum" "$size" "$chunk_sum"; then
+                rm -rf "$chunks"
+                return 1
+              fi
+              index=$((index + 1))
+            done
+            rm -rf "$chunks"
+            if ! upload_request /dev/null "${ENDPOINT%/}/$variant/complete" "$sum" "$size" ""; then
+              return 1
+            fi
+            echo "published $variant <- ${file##*/} ($sum)"
+          }
+
+          publish target/release/myapp linux-amd64
+```
+
+Commit and push the workflow to start a new run. Re-running an older run uses
+its original workflow version. For multiple files, add more `publish FILE VARIANT`
+calls with variants allowed by the server. The complete file size must still fit
+`MAX_UPLOAD_BYTES`.
+
 ## Building the Docker image on GitHub
 
 `.github/workflows/docker.yml` builds AMD64 and ARM64 images on pushes to `main`
