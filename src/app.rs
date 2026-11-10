@@ -23,7 +23,8 @@ use crate::
     config::Config,
 };
 
-pub(crate) struct Keys
+//STRUCTS
+pub(crate) struct Keys //CACHED GITHUB SIGNING KEYS
 {
     pub(crate) keys: HashMap<String, DecodingKey>,
     pub(crate) fetched: Option<Instant>,
@@ -34,7 +35,7 @@ pub(crate) struct App
     pub(crate) config: Config,
     pub(crate) http: Client,
     pub(crate) keys: Mutex<Keys>,
-    pub(crate) seen_jti: Mutex<HashMap<String, Instant>>,
+    pub(crate) seen_jti: Mutex<HashMap<String, Instant>>, //USED TOKEN IDS
 }
 
 #[derive(Deserialize)]
@@ -46,19 +47,23 @@ struct Claims
     repository_owner_id: String,
 }
 
-pub(crate) type Fail = (StatusCode, &'static str);
+//TYPES
+pub(crate) type Fail = (StatusCode, &'static str); //HTTP ERROR AND MESSAGE
 
+//IMPLEMENTATIONS
 impl App
 {
     async fn key_for(&self, kid: &str) -> Result<DecodingKey, Fail>
     {
         let mut keys = self.keys.lock().await;
 
+        //REUSE A KNOWN KEY
         if let Some(key) = keys.keys.get(kid)
         {
             return Ok(key.clone());
         }
 
+        //LIMIT REFRESHES FOR UNKNOWN KEY IDS
         let stale = keys
             .fetched
             .is_none_or(|at| at.elapsed() >= consts::JWKS_MIN_REFRESH);
@@ -68,6 +73,7 @@ impl App
             return Err((StatusCode::UNAUTHORIZED, "unknown key id"));
         }
 
+        //FETCH THE ISSUER'S PUBLIC KEYS
         let set: JwkSet = self
             .http
             .get(consts::JWKS_URL)
@@ -80,6 +86,7 @@ impl App
             .map_err(|_| (StatusCode::BAD_GATEWAY, "malformed key set"))?;
 
         keys.fetched = Some(Instant::now());
+        //SKIP KEYS WE CANNOT USE
         keys.keys = set
             .keys
             .iter()
@@ -100,8 +107,9 @@ impl App
     {
         let mut seen = self.seen_jti.lock().await;
 
-        seen.retain(|_, at| at.elapsed() < consts::JTI_TTL);
+        seen.retain(|_, at| at.elapsed() < consts::JTI_TTL); //FORGET OLD TOKEN IDS
 
+        //EACH TOKEN CAN BE USED ONCE
         if seen.insert(jti.to_owned(), Instant::now()).is_some()
         {
             return Err((StatusCode::UNAUTHORIZED, "token already used"));
@@ -112,29 +120,34 @@ impl App
 
     pub(crate) async fn authenticate(&self, headers: &HeaderMap) -> Result<(String, String), Fail>
     {
+        //READ THE BEARER TOKEN
         let token = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token"))?;
 
+        //USE THE HEADER TO SELECT A KEY
         let header = jsonwebtoken::decode_header(token).map_err(|_| (StatusCode::UNAUTHORIZED, "bad token"))?;
         let kid = header
             .kid
             .ok_or((StatusCode::UNAUTHORIZED, "token has no key id"))?;
         let key = self.key_for(&kid).await?;
 
+        //REQUIRE GITHUB, OUR AUDIENCE, AND RS256
         let mut validation = Validation::new(header.alg);
         validation.algorithms = vec![Algorithm::RS256];
         validation.set_audience(&[&self.config.audience]);
         validation.set_issuer(&[consts::ISSUER]);
         validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
-        validation.leeway = 30;
+        validation.leeway = 30; //ALLOW SMALL CLOCK DIFFERENCES
 
+        //VERIFY THE SIGNATURE AND CLAIMS
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
             .map_err(|_| (StatusCode::UNAUTHORIZED, "token rejected"))?
             .claims;
 
+        //CHECK THE OWNER, REPOSITORY, AND SUBJECT
         if claims.repository_owner_id != self.config.repository_owner_id
         {
             return Err((StatusCode::FORBIDDEN, "wrong owner"));
@@ -154,12 +167,14 @@ impl App
 
         self.claim_jti(&claims.jti).await?;
 
+        //EXTRACT THE BRANCH FROM THE SUBJECT
         let branch = claims
             .sub
             .split_once(":ref:refs/heads/")
             .map(|(_, b)| b.to_owned())
             .ok_or((StatusCode::FORBIDDEN, "subject carries no branch"))?;
 
+        //KEEP THE BRANCH SAFE FOR FILE NAMES
         if branch.is_empty() || branch.starts_with('.') ||
             !branch.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
         {

@@ -30,9 +30,11 @@ use futures_util::stream::StreamExt;
 
 use crate::app::{ App, Fail };
 
-pub(crate) static UPLOAD_LOCK: Mutex<()> = Mutex::const_new(());
+//GLOBAL VARIABLES
+pub(crate) static UPLOAD_LOCK: Mutex<()> = Mutex::const_new(()); //SERIALIZE ALL UPLOAD WRITES
 
-pub(crate) async fn upload
+//FUNCTIONS
+pub(crate) async fn upload //SINGLE REQUEST UPLOAD
 (
     State(app): State<Arc<App>>,
     Path(variant): Path<String>,
@@ -62,7 +64,7 @@ pub(crate) async fn upload
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "cannot open the data directory"))?;
 
     let _guard = UPLOAD_LOCK.lock().await;
-    let temp_path = dir.join(format!(".{asset}.incoming"));
+    let temp_path = dir.join(format!(".{asset}.incoming")); //KEEP PARTIAL DATA IN A TEMPORARY FILE
     let received = receive(&temp_path, body, app.config.max_bytes).await;
 
     let (size, actual) = match received
@@ -75,6 +77,7 @@ pub(crate) async fn upload
         }
     };
 
+    //PUBLISH ONLY VERIFIED DATA
     if declared != actual
     {
         let _ = afs::remove_file(&temp_path).await;
@@ -84,6 +87,7 @@ pub(crate) async fn upload
     let name = asset.clone();
     let digest = actual.clone();
 
+    //KEEP BLOCKING DISK OPERATIONS OFF THE ASYNC THREAD
     task::spawn_blocking(move || publish_atomically(&dir, &name, &digest))
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "write task failed"))?
@@ -104,12 +108,14 @@ pub(crate) async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result
     let mut hasher = Sha256::new();
     let mut size: u64 = 0;
 
+    //HASH AND WRITE WITHOUT BUFFERING THE WHOLE FILE
     while let Some(chunk) = stream.next().await
     {
         let chunk = chunk.map_err(|_| (StatusCode::BAD_REQUEST, "upload interrupted"))?;
 
         size += chunk.len() as u64;
 
+        //CHECK THE LIMIT BEFORE WRITING
         if size > max_bytes
         {
             return Err((StatusCode::PAYLOAD_TOO_LARGE, "upload too large"));
@@ -122,7 +128,7 @@ pub(crate) async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "write failed"))?;
     }
 
-    file.sync_all()
+    file.sync_all() //FLUSH FILE DATA TO DISK
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "sync failed"))?;
 
@@ -134,13 +140,14 @@ pub(crate) fn publish_atomically(dir: &FsPath, name: &str, digest: &str) -> io::
     let final_path = dir.join(name);
     let temp_path = dir.join(format!(".{name}.incoming"));
 
-    fs::rename(&temp_path, &final_path)?;
+    fs::rename(&temp_path, &final_path)?; //REPLACE THE FILE ATOMICALLY
 
     let sums_path = dir.join(format!("{name}.sha256"));
     let temp_sums = dir.join(format!(".{name}.sha256.incoming"));
 
+    //PUBLISH THE CHECKSUM THROUGH ITS OWN TEMPORARY FILE
     fs::write(&temp_sums, format!("{digest}  {name}\n"))?;
     fs::rename(&temp_sums, &sums_path)?;
 
-    File::open(dir)?.sync_all()
+    File::open(dir)?.sync_all() //FLUSH THE RENAMES TO DISK
 }

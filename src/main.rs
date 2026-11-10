@@ -30,7 +30,7 @@ use reqwest::Client;
 use app::{ App, Keys };
 use config::Config;
 
-async fn healthz() -> StatusCode
+async fn healthz() -> StatusCode //SERVER LIVENESS CHECK
 {
     StatusCode::NO_CONTENT
 }
@@ -42,6 +42,7 @@ async fn main()
 
     let listen = config.listen;
 
+    //SHARE THE CLIENT AND TOKEN CACHES
     let app = Arc::new(App
     {
         config,
@@ -68,6 +69,6 @@ async fn main()
 
     axum::serve(listener, router).with_graceful_shutdown(async
     {
-        let _ = signal::ctrl_c().await;
+        let _ = signal::ctrl_c().await; //LET ACTIVE REQUESTS FINISH
     }).await.expect("server failed");
 }

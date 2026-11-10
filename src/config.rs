@@ -6,22 +6,24 @@ use std::
     collections::{ HashMap, HashSet },
 };
 
+//STRUCTS
 pub(crate) struct Config
 {
     pub(crate) listen: SocketAddr,
-    pub(crate) data_dir: PathBuf,
-    pub(crate) upload_dir: PathBuf,
+    pub(crate) data_dir: PathBuf, //PUBLISHED FILES
+    pub(crate) upload_dir: PathBuf, //UNFINISHED CHUNKS
     pub(crate) audience: String,
     pub(crate) repository_owner_id: String,
-    pub(crate) prefixes: HashMap<String, String>,
+    pub(crate) prefixes: HashMap<String, String>, //REPOSITORY ID TO FILE PREFIX
     pub(crate) allowed_subs: HashSet<String>,
     pub(crate) allowed_variants: HashSet<String>,
-    pub(crate) max_bytes: u64,
+    pub(crate) max_bytes: u64, //MAXIMUM COMPLETE FILE SIZE
 }
 
+//IMPLEMENTATIONS
 impl Config
 {
-    pub(crate) fn from_env() -> Self
+    pub(crate) fn from_env() -> Self //READ SERVER SETTINGS
     {
         Self
         {
@@ -36,17 +38,18 @@ impl Config
             max_bytes: env::var("MAX_UPLOAD_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(256 * 1024 * 1024),
+                .unwrap_or(256 * 1024 * 1024), //DEFAULT TO 256 MIB
         }
     }
 }
 
-fn env_var(name: &str) -> String
+//FUNCTIONS
+fn env_var(name: &str) -> String //REQUIRE A VALUE
 {
     env::var(name).unwrap_or_else(|_| panic!("missing environment variable {name}"))
 }
 
-fn env_set(name: &str) -> HashSet<String>
+fn env_set(name: &str) -> HashSet<String> //COMMA SEPARATED VALUES
 {
     env_var(name)
         .split(',')
@@ -56,7 +59,7 @@ fn env_set(name: &str) -> HashSet<String>
         .collect()
 }
 
-fn env_map(name: &str) -> HashMap<String, String>
+fn env_map(name: &str) -> HashMap<String, String> //COMMA SEPARATED ID=PREFIX PAIRS
 {
     env_var(name)
         .split(',')
