@@ -10,6 +10,7 @@ pub(crate) struct Config
 {
     pub(crate) listen: SocketAddr,
     pub(crate) data_dir: PathBuf,
+    pub(crate) upload_dir: PathBuf,
     pub(crate) audience: String,
     pub(crate) repository_owner_id: String,
     pub(crate) prefixes: HashMap<String, String>,
@@ -26,6 +27,7 @@ impl Config
         {
             listen: env_var("LISTEN_ADDR").parse().expect("LISTEN_ADDR is not an address"),
             data_dir: PathBuf::from(env_var("DATA_DIR")),
+            upload_dir: PathBuf::from(env_var("UPLOAD_DIR")),
             audience: env_var("OIDC_AUDIENCE"),
             repository_owner_id: env_var("REPOSITORY_OWNER_ID"),
             prefixes: env_map("ASSET_PREFIXES"),

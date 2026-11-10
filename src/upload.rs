@@ -9,6 +9,7 @@ use std::
 use tokio::
 {
     task,
+    sync::Mutex,
     io::AsyncWriteExt,
     fs::
     {
@@ -28,6 +29,8 @@ use sha2::{ Digest, Sha256 };
 use futures_util::stream::StreamExt;
 
 use crate::app::{ App, Fail };
+
+pub(crate) static UPLOAD_LOCK: Mutex<()> = Mutex::const_new(());
 
 pub(crate) async fn upload
 (
@@ -58,6 +61,7 @@ pub(crate) async fn upload
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "cannot open the data directory"))?;
 
+    let _guard = UPLOAD_LOCK.lock().await;
     let temp_path = dir.join(format!(".{asset}.incoming"));
     let received = receive(&temp_path, body, app.config.max_bytes).await;
 
@@ -90,7 +94,7 @@ pub(crate) async fn upload
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result<(u64, String), Fail>
+pub(crate) async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result<(u64, String), Fail>
 {
     let mut file = AFile::create(path)
         .await
@@ -125,7 +129,7 @@ async fn receive(path: &FsPath, body: Body, max_bytes: u64) -> Result<(u64, Stri
     Ok((size, hex::encode(hasher.finalize())))
 }
 
-fn publish_atomically(dir: &FsPath, name: &str, digest: &str) -> io::Result<()>
+pub(crate) fn publish_atomically(dir: &FsPath, name: &str, digest: &str) -> io::Result<()>
 {
     let final_path = dir.join(name);
     let temp_path = dir.join(format!(".{name}.incoming"));

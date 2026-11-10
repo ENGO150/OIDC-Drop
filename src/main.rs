@@ -1,4 +1,5 @@
 mod app;
+mod chunked;
 mod config;
 mod consts;
 mod upload;
@@ -54,6 +55,8 @@ async fn main()
 
     let router = Router::new()
         .route("/upload/{variant}", routing::put(upload::upload))
+        .route("/upload/{variant}/chunks/{index}", routing::put(chunked::part))
+        .route("/upload/{variant}/complete", routing::put(chunked::complete))
         .route("/healthz", routing::get(healthz))
         .with_state(app);
 
