@@ -1,0 +1,27 @@
+services:
+  oidc-drop:
+    build: .
+    restart: unless-stopped
+    container_name: oidc-drop
+    # With rootless Docker, container root maps to the host daemon user.
+    # user: "0:0"
+    read_only: true
+    cap_drop: [ ALL ]
+    security_opt: [ "no-new-privileges:true" ]
+    pids_limit: 64
+    mem_limit: 128m
+    tmpfs: [ /tmp ]
+    ports: [ "8080:8080" ]
+    volumes:
+      - ./data:/data
+      - ./uploads:/uploads
+    environment:
+      LISTEN_ADDR: "0.0.0.0:8080"
+      DATA_DIR: "/data"
+      UPLOAD_DIR: "/uploads"
+      OIDC_AUDIENCE: "oidc-drop"
+      REPOSITORY_OWNER_ID: "${REPOSITORY_OWNER_ID:?Set REPOSITORY_OWNER_ID in .env or the shell}"
+      ASSET_PREFIXES: "${ASSET_PREFIXES:?Set ASSET_PREFIXES to repository_id=prefix pairs in .env or the shell}"
+      ALLOWED_SUBS: "${ALLOWED_SUBS:?Set ALLOWED_SUBS in .env or the shell}"
+      ALLOWED_VARIANTS: "${ALLOWED_VARIANTS:?Set ALLOWED_VARIANTS in .env or the shell}"
+      MAX_UPLOAD_BYTES: "268435456"
