@@ -1,3 +1,5 @@
+mod consts;
+
 use std::
 {
     fs,
@@ -39,11 +41,6 @@ use tokio::
     io::AsyncWriteExt,
     sync::Mutex,
 };
-
-const ISSUER: &str = "https://token.actions.githubusercontent.com";
-const JWKS_URL: &str = "https://token.actions.githubusercontent.com/.well-known/jwks";
-const JWKS_MIN_REFRESH: Duration = Duration::from_secs(300);
-const JTI_TTL: Duration = Duration::from_secs(30 * 60);
 
 struct Config
 {
@@ -127,7 +124,7 @@ impl App
 
         let stale = keys
             .fetched
-            .is_none_or(|at| at.elapsed() >= JWKS_MIN_REFRESH);
+            .is_none_or(|at| at.elapsed() >= consts::JWKS_MIN_REFRESH);
 
         if !stale
         {
@@ -136,7 +133,7 @@ impl App
 
         let set: jwk::JwkSet = self
             .http
-            .get(JWKS_URL)
+            .get(consts::JWKS_URL)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
@@ -166,7 +163,7 @@ impl App
     {
         let mut seen = self.seen_jti.lock().await;
 
-        seen.retain(|_, at| at.elapsed() < JTI_TTL);
+        seen.retain(|_, at| at.elapsed() < consts::JTI_TTL);
 
         if seen.insert(jti.to_owned(), Instant::now()).is_some()
         {
@@ -195,7 +192,7 @@ impl App
         let mut validation = Validation::new(header.alg);
         validation.algorithms = vec![jsonwebtoken::Algorithm::RS256];
         validation.set_audience(&[&self.config.audience]);
-        validation.set_issuer(&[ISSUER]);
+        validation.set_issuer(&[consts::ISSUER]);
         validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
         validation.leeway = 30;
 
