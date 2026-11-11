@@ -2,6 +2,7 @@ mod app;
 mod chunked;
 mod config;
 mod consts;
+mod logging;
 mod storage;
 mod upload;
 #[cfg(test)]
@@ -39,6 +40,7 @@ use axum::
 {
     Router,
     routing,
+    middleware,
     extract::State,
     http::StatusCode,
 };
@@ -81,6 +83,7 @@ fn router(app: Arc<App>) -> Router
         .route("/upload/{variant}/complete", routing::put(chunked::complete))
         .route("/healthz", routing::get(healthz))
         .route("/readyz", routing::get(readyz))
+        .layer(middleware::from_fn(logging::request))
         .with_state(app)
 }
 
@@ -95,10 +98,14 @@ async fn shutdown()
 
     #[cfg(not(unix))]
     let _ = signal::ctrl_c().await;
+
+    tracing::info!("shutdown requested; draining active requests");
 }
 
 fn main()
 {
+    logging::init();
+
     Builder::new_multi_thread().worker_threads(2).max_blocking_threads(16).enable_all().build()
         .expect("cannot build runtime").block_on(run());
 }
@@ -108,6 +115,18 @@ async fn run()
     let config = Config::from_env();
 
     let listen = config.listen;
+    tracing::info!
+    (
+        version = env!("CARGO_PKG_VERSION"), %listen,
+        data_dir = %config.data_dir.display(), upload_dir = %config.upload_dir.display(),
+        max_upload_bytes = config.max_bytes, max_staging_bytes = config.staging_bytes,
+        max_staging_uploads = config.staging_uploads, concurrency = config.concurrency,
+        idle_timeout_secs = config.idle_timeout.as_secs(),
+        upload_timeout_secs = config.upload_timeout.as_secs(),
+        staging_ttl_secs = config.staging_ttl.as_secs(), min_free_bytes = config.min_free_bytes,
+        repositories = config.prefixes.len(), subjects = config.allowed_subs.len(),
+        variants = config.allowed_variants.len(), "starting server"
+    );
     fs::create_dir_all(&config.data_dir).expect("cannot create DATA_DIR");
     fs::create_dir_all(&config.upload_dir).expect("cannot create UPLOAD_DIR");
 
@@ -123,6 +142,8 @@ async fn run()
 
     let _upload_lock =
         storage::lock_directory(&uploads).expect("UPLOAD_DIR is in use or not writable");
+
+    tracing::info!("storage directories locked");
 
     let replay = Replay::open(data.join(".replay")).expect("cannot open replay storage");
 
@@ -168,7 +189,7 @@ async fn run()
             {
                 Ok(Ok(())) =>
                 {}
-                result => eprintln!("maintenance failed: {result:?}"),
+                result => tracing::error!(?result, "maintenance failed"),
             }
 
             let versions = maintenance.config.data_dir.join(".versions");
@@ -186,7 +207,10 @@ async fn run()
                         let _ = task::spawn_blocking(move ||
                         {
                             let _guard = guard;
-                            upload::cleanup_versions(&path)
+                            upload::cleanup_versions(&path).inspect_err(|error|
+                            {
+                                tracing::error!(%error, "version cleanup failed");
+                            })
                         }).await;
                     }
                 }
@@ -210,9 +234,9 @@ async fn run()
 
                             match fs::remove_file(path)
                             {
-                                Ok(()) => {}
+                                Ok(()) => tracing::info!("removed abandoned incoming file"),
                                 Err(error) if error.kind() == ErrorKind::NotFound => {}
-                                Err(error) => eprintln!("temporary file cleanup failed: {error}"),
+                                Err(error) => tracing::error!(%error, "temporary file cleanup failed"),
                             }
                         }).await;
                     }
@@ -224,8 +248,9 @@ async fn run()
     });
 
     let listener = TcpListener::bind(listen).await.expect("cannot bind listener");
-    println!("listening on {listen}");
+    tracing::info!(address = %listener.local_addr().expect("listener address"), "listening");
     //DRAIN REQUESTS BEFORE SHUTDOWN
     axum::serve(listener, router(app)).with_graceful_shutdown(shutdown()).await
         .expect("server failed");
+    tracing::info!("server stopped");
 }

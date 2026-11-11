@@ -40,9 +40,11 @@ use axum::
 
 use sha2::{ Digest, Sha256 };
 use futures_util::StreamExt;
+use tracing::Span;
 
 use crate::
 {
+    logging,
     storage,
     app::{ App, Fail },
 };
@@ -52,7 +54,7 @@ pub(crate) fn digest_header(headers: &HeaderMap, name: &str) -> Result<String, F
 {
     headers.get(name).and_then(|v| v.to_str().ok())
         .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
-        .map(str::to_ascii_lowercase).ok_or((StatusCode::BAD_REQUEST, "invalid SHA-256 digest"))
+        .map(str::to_ascii_lowercase).ok_or_else(|| logging::reject(StatusCode::BAD_REQUEST, "invalid SHA-256 digest"))
 }
 
 pub(crate) async fn upload
@@ -69,7 +71,7 @@ pub(crate) async fn upload
 
     if !app.config.allowed_variants.contains(&variant)
     {
-        return Err((StatusCode::BAD_REQUEST, "unknown variant"));
+        return Err(logging::reject(StatusCode::BAD_REQUEST, "unknown variant"));
     }
 
     let asset = format!("{prefix}-{branch}-{variant}");
@@ -77,10 +79,13 @@ pub(crate) async fn upload
     let declared = digest_header(&headers, "x-content-sha256")?;
 
     let _guard = app.lock_asset(&asset)?;
-    storage::ensure_space(
+    storage::ensure_space
+    (
         app.config.data_dir.clone(),
         app.config.max_bytes.saturating_add(app.config.min_free_bytes),
     ).await?;
+
+    tracing::info!(%asset, max_bytes = app.config.max_bytes, "receiving artifact");
 
     let temp = app.config.data_dir.join(format!(".{asset}.incoming"));
 
@@ -108,11 +113,11 @@ pub(crate) async fn upload
     {
         let _ = afs::remove_file(&temp).await;
 
-        return Err((StatusCode::BAD_REQUEST, "digest mismatch"));
+        return Err(logging::reject(StatusCode::BAD_REQUEST, "digest mismatch"));
     }
 
     publish(&app, &asset, &actual, _guard, _slot).await?;
-    println!("published {asset} ({size} bytes, {actual})");
+    tracing::info!(%asset, bytes = size, sha256 = %actual, "artifact published");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -133,11 +138,13 @@ pub(crate) async fn receive
         let mut stream = body.into_data_stream();
         let mut hasher = Sha256::new();
         let mut size = 0u64;
+        let mut next_progress = 16 * 1024 * 1024;
+        let started = Instant::now();
 
         loop
         {
             let chunk = time::timeout(idle, stream.next()).await
-                .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "upload idle timeout"))?;
+                .map_err(|_| logging::reject(StatusCode::REQUEST_TIMEOUT, "upload idle timeout"))?;
 
             let Some(chunk) = chunk
             else
@@ -145,22 +152,31 @@ pub(crate) async fn receive
                 break;
             };
 
-            let chunk = chunk.map_err(|_| (StatusCode::BAD_REQUEST, "upload interrupted"))?;
+            let chunk = chunk.map_err(|_| logging::reject(StatusCode::BAD_REQUEST, "upload interrupted"))?;
             size = size.checked_add(chunk.len() as u64).filter(|size| *size <= max_bytes)
-                .ok_or((StatusCode::PAYLOAD_TOO_LARGE, "upload too large"))?;
+                .ok_or_else(|| logging::reject(StatusCode::PAYLOAD_TOO_LARGE, "upload too large"))?;
             hasher.update(&chunk);
             file.write_all(&chunk).await.map_err(storage::disk_error)?;
+
+            if size >= next_progress
+            {
+                tracing::info!(bytes_received = size, max_bytes, elapsed_ms = started.elapsed().as_millis(),
+                    "upload progress");
+                next_progress = size.saturating_add(16 * 1024 * 1024);
+            }
         }
 
         if size == 0
         {
-            return Err((StatusCode::BAD_REQUEST, "empty upload"));
+            return Err(logging::reject(StatusCode::BAD_REQUEST, "empty upload"));
         }
 
         file.sync_all().await.map_err(storage::disk_error)?;
 
+        tracing::info!(bytes_received = size, elapsed_ms = started.elapsed().as_millis(), "body received and synced");
+
         Ok((size, hex::encode(hasher.finalize())))
-    }).await.map_err(|_| (StatusCode::REQUEST_TIMEOUT, "upload total timeout"))?
+    }).await.map_err(|_| logging::reject(StatusCode::REQUEST_TIMEOUT, "upload total timeout"))?
 }
 
 pub(crate) async fn publish
@@ -172,6 +188,9 @@ pub(crate) async fn publish
     slot: OwnedSemaphorePermit,
 ) -> Result<(), Fail>
 {
+    tracing::info!(%asset, "publishing verified artifact");
+    let span = Span::current();
+
     let root = app.config.data_dir.clone();
 
     let locks = app.directory_locks.clone();
@@ -181,13 +200,15 @@ pub(crate) async fn publish
     let digest = digest.to_owned();
     task::spawn_blocking(move ||
     {
+        let _entered = span.enter();
+
         let _guard = guard;
 
         let _slot = slot;
 
         let _directory_locks = locks;
         publish_atomically(&root, &name, &digest)
-    }).await.map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "publication task failed"))?
+    }).await.map_err(|_| logging::reject(StatusCode::INTERNAL_SERVER_ERROR, "publication task failed"))?
     .map_err(storage::disk_error)
 }
 
@@ -261,6 +282,8 @@ pub(crate) fn publish_atomically(dir: &FsPath, name: &str, digest: &str) -> IoRe
     //PRESERVE LEGACY FILES BEFORE SWITCHING
     if !current.exists() && public.symlink_metadata().is_ok_and(|m| m.is_file())
     {
+        tracing::info!(asset = name, "migrating legacy artifact");
+
         let legacy = versions.join(".legacy");
 
         if legacy.exists()
@@ -326,7 +349,7 @@ pub(crate) fn publish_atomically(dir: &FsPath, name: &str, digest: &str) -> IoRe
     //CLEANUP MUST NOT FAIL A COMMIT
     if let Err(error) = cleanup_versions(&versions)
     {
-        eprintln!("version cleanup failed: {error}");
+        tracing::error!(%error, asset = name, "version cleanup failed");
     }
 
     Ok(())
@@ -344,6 +367,7 @@ pub(crate) fn cleanup_versions(versions: &FsPath) -> IoResult<()>
             && current.as_deref() != Some(FsPath::new(&entry.file_name()))
         {
             fs::remove_dir_all(entry.path())?;
+            tracing::info!(asset_dir = %versions.display(), "removed obsolete artifact version");
         }
     }
 
