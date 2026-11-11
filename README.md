@@ -67,10 +67,36 @@ a reverse proxy on the same host, change it to `127.0.0.1:8080:8080`.
 - `./uploads` holds unfinished chunks. Its persistent mount preserves chunks
   across container restarts. Keep it outside the public download directory.
 
-Run one server instance per storage directory. Upload writes are serialized.
-Allow space for staged chunks, the assembled file and the previous published
-file. Other staging directories older than 24 hours are removed when a chunk
-arrives; the current upload is kept.
+Run one server instance per storage directory on a local Linux filesystem that
+supports file locking, symlinks, atomic rename, and directory fsync. The server
+locks both directories for its lifetime and refuses overlapping storage paths.
+Do not remove `.oidc-drop.lock` while a server is running. Network filesystems and
+multiple replicas sharing storage are not supported.
+
+The runtime uses two async worker threads and at most sixteen blocking I/O
+threads to fit the container process/memory limits. Up to four upload requests
+run concurrently by default. Different artifacts can
+upload independently; a simultaneous request for the same artifact gets 409.
+Requests beyond capacity get 503 immediately. Retry these with fresh tokens.
+Bodies have a 30-second idle timeout and a 15-minute total timeout by default.
+Assembly also has a 15-minute deadline.
+
+Staged chunk sessions reserve their complete declared size before receiving data.
+The defaults allow 1 GiB across at most 128 sessions. Oversubscribed staging
+returns 507. Reservations survive restarts. Legacy staged uploads are adopted
+conservatively, reserving at least `MAX_UPLOAD_BYTES` each. Inactive sessions older
+than 24 hours are removed at startup and every minute, even without new uploads;
+active requests are protected. Cleanup is no longer performed on every chunk.
+
+Allow additional space beyond the staging quota for published artifacts, one new
+artifact per active request, and a replacement chunk per active chunk request.
+A conservative temporary-space allowance is `MAX_CONCURRENT_UPLOADS *
+(MAX_UPLOAD_BYTES + 64 MiB)`, in addition to the staged and published data.
+Free-space admission checks reserve a 64 MiB headroom by default, but other
+processes can consume space after a check. Monitor filesystem capacity externally.
+`GET /readyz` returns 204 when both storage filesystems have that headroom and
+507 when space is low (503 when request capacity is exhausted); `/healthz`
+remains a process liveness check.
 
 For Caddy running on the host, use a configuration like this. Replace the domain
 and absolute path with your own:
@@ -104,11 +130,26 @@ Request it with audience `oidc-drop` (or your configured `OIDC_AUDIENCE`), then
 send it as `Authorization: Bearer <token>` over HTTPS.
 
 Each request, including retries and completion, needs a fresh token. A token ID
-can only be used once. `ALLOWED_SUBS` must match the token's exact subject, for
+can only be used once, including across server restarts. Hashed token IDs are
+recorded and fsynced in `DATA_DIR/.replay` until their token expires (including
+clock leeway). Keep this directory persistent and private; clearing it resets
+replay protection. The replay store is capped at 100,000 unexpired records and
+fails closed at capacity. Expired records are reclaimed every minute.
+
+Tokens require `exp`, `nbf`, `iat`, and a nonempty `jti`; `nbf` and expiry are
+validated with 30 seconds of clock leeway. Token lifetime may not exceed one
+hour. Keep the server clock synchronized. Signing keys are refreshed on the first
+request after five minutes; expired cached keys are never accepted. Refresh
+failures back off for 30 seconds. Concurrent requests during a refresh may get
+503 and should retry with fresh tokens. `ALLOWED_SUBS` must match the token's exact subject, for
 example `repo:YOUR_OWNER/YOUR_REPO:ref:refs/heads/main`. This server requires
 branch subjects; tags, pull requests and environment subjects are not supported.
-Branch names used in file names may contain only ASCII letters, digits, `.`, `_`
-and `-`, and must not start with `.`.
+Prefixes, branch names, and variants may contain only ASCII letters, digits,
+`.`, `_`, and `-`, must not start with `.`, and may not exceed 128 bytes each.
+Complete artifact names may not exceed 180 bytes. Startup rejects empty allowlists,
+duplicate repository IDs or prefixes, and configurations where any allowed
+prefix/branch/variant combination collides with another artifact or checksum
+name. Existing `prefix-branch-variant` download names are preserved.
 
 For a single request, send `PUT /upload/{variant}` with the file as the body and
 `X-Content-SHA256` containing its hex SHA-256. Success returns `204 No Content`.
@@ -125,7 +166,16 @@ All chunks must be exactly 64 MiB except the final one. Successful requests
 return 204. Retrying a chunk replaces it; retrying completion verifies the
 already published file. The server assembles chunks in order inside `DATA_DIR`,
 verifies the complete digest, then replaces the published file by atomic rename.
-The checksum sidecar is published separately.
+Both public paths resolve through one atomic version pointer. A checksum-write
+failure leaves the previous pair published. The public filenames are unchanged,
+but are now symlinks into `DATA_DIR/.versions`; keep that hidden directory in
+backups and mount the entire data directory into Caddy. Existing regular files
+are migrated on their next successful upload. Old versions are reclaimed after
+commit and during maintenance. A reader with an already-open file keeps reading
+that version. Two separate HTTP requests can straddle a publication; download
+clients should verify the SHA-256 and retry if an update occurred between them.
+
+Empty uploads are rejected.
 
 The default maximum **complete file size** is 256 MiB, including chunked uploads.
 Increase `MAX_UPLOAD_BYTES` in Compose if needed. Any proxy must also allow each
@@ -296,14 +346,33 @@ Set these environment variables before running `cargo run --release --locked`:
 | `ALLOWED_SUBS` | Comma-separated exact branch subjects |
 | `ALLOWED_VARIANTS` | Comma-separated artifact variants |
 | `MAX_UPLOAD_BYTES` | Optional complete file limit; defaults to 268435456 bytes |
+| `MAX_CONCURRENT_UPLOADS` | Concurrent requests, 1–32; default 4 |
+| `UPLOAD_IDLE_TIMEOUT_SECS` | Maximum wait for the next body frame; default 30 |
+| `UPLOAD_TIMEOUT_SECS` | Total body/assembly deadline; default 900 |
+| `MAX_STAGING_BYTES` | Total declared size of unfinished chunk sessions; default 1073741824 |
+| `MAX_STAGING_UPLOADS` | Maximum unfinished sessions, 1–10000; default 128 |
+| `STAGING_TTL_SECS` | Inactive staging retention; default 86400 |
+| `MIN_FREE_DISK_BYTES` | Filesystem free-space headroom; default 67108864 |
 
 The Rust binary does not load `.env` automatically. Export the values in your
-shell or provide them through your service manager. Use a current stable Rust
-toolchain to build the project.
+shell or provide them through your service manager. Use Rust 1.89 or newer (current stable recommended)
+to build the project. Optional numeric settings must be positive
+integers; invalid values fail startup rather than silently using defaults.
+`MAX_STAGING_BYTES` must be at least `MAX_UPLOAD_BYTES`. When using Compose, add
+optional settings to its `environment` block to change the application defaults.
 
 ## Build checks
 
 ```sh
-cargo check --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
+cargo build --release --locked
+cargo audit --deny warnings
 ```
+
+
+CI runs strict Clippy, regression tests, a release build, dependency
+auditing, and a container vulnerability scan. Image publishing depends on these
+checks. Checks also run on pull requests and daily; Dependabot checks Rust,
+GitHub Actions, and Docker dependencies weekly. Test RSA fixtures are generated
+keys used only for local tests; they are not production credentials.

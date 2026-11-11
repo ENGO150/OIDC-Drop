@@ -1,41 +1,79 @@
 use std::
 {
-    collections::HashMap,
+    fs::File,
     time::Instant,
+    collections::HashMap,
+    sync::
+    {
+        Arc,
+        Mutex as StdMutex,
+    },
 };
+
+use tokio::
+{
+    task,
+    sync::
+    {
+        Mutex,
+        RwLock,
+        Semaphore,
+        OwnedMutexGuard,
+        OwnedSemaphorePermit,
+    },
+};
+
+use axum::http::{ HeaderMap, StatusCode };
+use reqwest::{ Client, Response };
+use serde::Deserialize;
+use futures_util::StreamExt;
 
 use jsonwebtoken::
 {
     Algorithm,
-    DecodingKey,
     Validation,
-    jwk::JwkSet,
+    DecodingKey,
+    jwk::
+    {
+        JwkSet,
+        KeyAlgorithm,
+        PublicKeyUse,
+        KeyOperations,
+        AlgorithmParameters,
+    },
 };
-
-use tokio::sync::Mutex;
-use serde::Deserialize;
-use reqwest::{ Client, Response };
-use axum::http::{ HeaderMap, StatusCode };
 
 use crate::
 {
     consts,
-    config::Config,
+    config::{ self, Config },
+    storage::{ self, Replay, Staging },
 };
 
+#[cfg(test)]
+#[path = "tests/app.rs"]
+mod tests;
+
 //STRUCTS
-pub(crate) struct Keys //CACHED GITHUB SIGNING KEYS
+#[derive(Default)]
+pub(crate) struct Keys
 {
     pub(crate) keys: HashMap<String, DecodingKey>,
     pub(crate) fetched: Option<Instant>,
+    attempted: Option<Instant>,
 }
 
 pub(crate) struct App
 {
     pub(crate) config: Config,
+    pub(crate) directory_locks: Arc<Vec<File>>,
     pub(crate) http: Client,
-    pub(crate) keys: Mutex<Keys>,
-    pub(crate) seen_jti: Mutex<HashMap<String, Instant>>, //USED TOKEN IDS
+    pub(crate) keys: RwLock<Keys>,
+    pub(crate) refresh: Mutex<()>,
+    pub(crate) replay: Arc<StdMutex<Replay>>,
+    pub(crate) staging: Arc<StdMutex<Staging>>,
+    pub(crate) slots: Arc<Semaphore>,
+    pub(crate) assets: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 #[derive(Deserialize)]
@@ -45,119 +83,163 @@ struct Claims
     jti: String,
     repository_id: String,
     repository_owner_id: String,
+    exp: u64,
+    iat: u64,
+    nbf: u64,
 }
 
 //TYPES
-pub(crate) type Fail = (StatusCode, &'static str); //HTTP ERROR AND MESSAGE
+pub(crate) type Fail = (StatusCode, &'static str);
 
 //IMPLEMENTATIONS
 impl App
 {
-    async fn key_for(&self, kid: &str) -> Result<DecodingKey, Fail>
+    pub(crate) fn admit(&self) -> Result<OwnedSemaphorePermit, Fail>
     {
-        let mut keys = self.keys.lock().await;
-
-        //REUSE A KNOWN KEY
-        if let Some(key) = keys.keys.get(kid)
-        {
-            return Ok(key.clone());
-        }
-
-        //LIMIT REFRESHES FOR UNKNOWN KEY IDS
-        let stale = keys
-            .fetched
-            .is_none_or(|at| at.elapsed() >= consts::JWKS_MIN_REFRESH);
-
-        if !stale
-        {
-            return Err((StatusCode::UNAUTHORIZED, "unknown key id"));
-        }
-
-        //FETCH THE ISSUER'S PUBLIC KEYS
-        let set: JwkSet = self
-            .http
-            .get(consts::JWKS_URL)
-            .send()
-            .await
-            .and_then(Response::error_for_status)
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "cannot reach the issuer"))?
-            .json()
-            .await
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "malformed key set"))?;
-
-        keys.fetched = Some(Instant::now());
-        //SKIP KEYS WE CANNOT USE
-        keys.keys = set
-            .keys
-            .iter()
-            .filter_map(|k|
-            {
-                let id = k.common.key_id.clone()?;
-                Some((id, DecodingKey::from_jwk(k).ok()?))
-            })
-            .collect();
-
-        keys.keys
-            .get(kid)
-            .cloned()
-            .ok_or((StatusCode::UNAUTHORIZED, "unknown key id"))
+        self.slots.clone().try_acquire_owned()
+            .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "upload capacity reached"))
     }
 
-    async fn claim_jti(&self, jti: &str) -> Result<(), Fail>
+    pub(crate) fn lock_asset(&self, asset: &str) -> Result<OwnedMutexGuard<()>, Fail>
     {
-        let mut seen = self.seen_jti.lock().await;
+        let mut assets = self.assets.lock().expect("asset lock poisoned");
+        assets.retain(|_, lock| Arc::strong_count(lock) > 1);
+        assets.entry(asset.to_owned()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+            .try_lock_owned().map_err(|_| (StatusCode::CONFLICT, "artifact upload busy"))
+    }
 
-        seen.retain(|_, at| at.elapsed() < consts::JTI_TTL); //FORGET OLD TOKEN IDS
+    async fn key_for(&self, kid: &str) -> Result<DecodingKey, Fail>
+    {
+        self.key_for_url(kid, consts::JWKS_URL).await
+    }
 
-        //EACH TOKEN CAN BE USED ONCE
-        if seen.insert(jti.to_owned(), Instant::now()).is_some()
+    async fn key_for_url(&self, kid: &str, url: &str) -> Result<DecodingKey, Fail>
+    {
         {
-            return Err((StatusCode::UNAUTHORIZED, "token already used"));
+            let keys = self.keys.read().await;
+
+            if keys.fetched.is_some_and(|at| at.elapsed() < consts::JWKS_MIN_REFRESH)
+            {
+                return keys.keys.get(kid).cloned()
+                    .ok_or((StatusCode::UNAUTHORIZED, "unknown key id"));
+            }
         }
 
-        Ok(())
+        let _refresh = self.refresh.try_lock()
+            .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "issuer keys refreshing"))?;
+        {
+            let mut keys = self.keys.write().await;
+            //RECHECK AFTER ACQUIRING REFRESH
+            if keys.fetched.is_some_and(|at| at.elapsed() < consts::JWKS_MIN_REFRESH)
+            {
+                return keys.keys.get(kid).cloned()
+                    .ok_or((StatusCode::UNAUTHORIZED, "unknown key id"));
+            }
+
+            if keys.attempted.is_some_and(|at| at.elapsed() < consts::JWKS_FAILURE_BACKOFF)
+            {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "issuer keys unavailable"));
+            }
+
+            keys.attempted = Some(Instant::now());
+        }
+
+        //REFRESH WITHOUT THE CACHE LOCK
+        let response = self.http.get(url).send().await.and_then(Response::error_for_status)
+            .map_err(|_| (StatusCode::BAD_GATEWAY, "cannot reach the issuer"))?;
+
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+
+        while let Some(chunk) = stream.next().await
+        {
+            let chunk = chunk.map_err(|_| (StatusCode::BAD_GATEWAY, "cannot read issuer keys"))?;
+
+            if bytes.len() + chunk.len() > 256 * 1024
+            {
+                return Err((StatusCode::BAD_GATEWAY, "issuer key set too large"));
+            }
+
+            bytes.extend_from_slice(&chunk);
+        }
+
+        let set: JwkSet = serde_json::from_slice(&bytes)
+            .map_err(|_| (StatusCode::BAD_GATEWAY, "malformed key set"))?;
+
+        let fresh: HashMap<_, _> = set.keys.iter()
+            .filter(|key|
+            {
+                matches!(key.algorithm, AlgorithmParameters::RSA(_))
+                    && key.common.key_algorithm.is_none_or(|alg| alg == KeyAlgorithm::RS256)
+                    && key.common.public_key_use.as_ref()
+                        .is_none_or(|usage| *usage == PublicKeyUse::Signature)
+                    && key.common.key_operations.as_ref()
+                        .is_none_or(|ops| ops.contains(&KeyOperations::Verify))
+            })
+            .filter_map(|key| Some((key.common.key_id.clone()?, DecodingKey::from_jwk(key).ok()?)))
+            .collect();
+
+        if fresh.is_empty()
+        {
+            return Err((StatusCode::BAD_GATEWAY, "empty key set"));
+        }
+
+        let mut keys = self.keys.write().await;
+        keys.keys = fresh;
+        keys.fetched = Some(Instant::now());
+        keys.keys.get(kid).cloned().ok_or((StatusCode::UNAUTHORIZED, "unknown key id"))
     }
 
     pub(crate) async fn authenticate(&self, headers: &HeaderMap) -> Result<(String, String), Fail>
     {
-        //READ THE BEARER TOKEN
-        let token = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+        let token = headers.get("authorization").and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer ")).filter(|token| token.len() <= 16384).ok_or
+            ((
+                StatusCode::UNAUTHORIZED,
+                "missing or oversized bearer token",
+            ))?;
 
-        //USE THE HEADER TO SELECT A KEY
-        let header = jsonwebtoken::decode_header(token).map_err(|_| (StatusCode::UNAUTHORIZED, "bad token"))?;
-        let kid = header
-            .kid
-            .ok_or((StatusCode::UNAUTHORIZED, "token has no key id"))?;
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "bad token"))?;
+
+        if header.alg != Algorithm::RS256
+        {
+            return Err((StatusCode::UNAUTHORIZED, "unsupported token algorithm"));
+        }
+
+        let kid = header.kid.filter(|kid| kid.len() <= 256)
+            .ok_or((StatusCode::UNAUTHORIZED, "invalid key id"))?;
+
         let key = self.key_for(&kid).await?;
 
-        //REQUIRE GITHUB, OUR AUDIENCE, AND RS256
-        let mut validation = Validation::new(header.alg);
-        validation.algorithms = vec![Algorithm::RS256];
+        let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[&self.config.audience]);
         validation.set_issuer(&[consts::ISSUER]);
-        validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
-        validation.leeway = 30; //ALLOW SMALL CLOCK DIFFERENCES
+        validation.set_required_spec_claims(&["exp", "nbf", "aud", "iss", "sub"]);
+        validation.validate_nbf = true;
+        validation.leeway = consts::CLOCK_LEEWAY;
 
-        //VERIFY THE SIGNATURE AND CLAIMS
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "token rejected"))?
-            .claims;
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "token rejected"))?.claims;
 
-        //CHECK THE OWNER, REPOSITORY, AND SUBJECT
+        let now = storage::now();
+
+        if claims.jti.is_empty()
+            || claims.jti.len() > 256
+            || claims.iat > now.saturating_add(consts::CLOCK_LEEWAY)
+            || claims.exp <= claims.iat
+            || claims.exp - claims.iat > consts::MAX_TOKEN_LIFETIME
+            || claims.nbf > claims.exp
+        {
+            return Err((StatusCode::UNAUTHORIZED, "invalid token lifetime or ID"));
+        }
+
         if claims.repository_owner_id != self.config.repository_owner_id
         {
             return Err((StatusCode::FORBIDDEN, "wrong owner"));
         }
 
-        let prefix = self
-            .config
-            .prefixes
-            .get(&claims.repository_id)
-            .cloned()
+        let prefix = self.config.prefixes.get(&claims.repository_id).cloned()
             .ok_or((StatusCode::FORBIDDEN, "wrong repository"))?;
 
         if !self.config.allowed_subs.contains(&claims.sub)
@@ -165,21 +247,22 @@ impl App
             return Err((StatusCode::FORBIDDEN, "subject not allowed"));
         }
 
-        self.claim_jti(&claims.jti).await?;
+        let branch = claims.sub.split_once(":ref:refs/heads/").map(|(_, b)| b.to_owned())
+            .filter(|b| config::safe_component(b))
+            .ok_or((StatusCode::FORBIDDEN, "unusable branch name"))?;
 
-        //EXTRACT THE BRANCH FROM THE SUBJECT
-        let branch = claims
-            .sub
-            .split_once(":ref:refs/heads/")
-            .map(|(_, b)| b.to_owned())
-            .ok_or((StatusCode::FORBIDDEN, "subject carries no branch"))?;
-
-        //KEEP THE BRANCH SAFE FOR FILE NAMES
-        if branch.is_empty() || branch.starts_with('.') ||
-            !branch.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        let replay = self.replay.clone();
+        task::spawn_blocking(move ||
         {
-            return Err((StatusCode::FORBIDDEN, "unusable branch name"));
-        }
+            replay.lock().expect("replay lock poisoned")
+                .claim(&claims.jti, claims.exp.saturating_add(consts::CLOCK_LEEWAY))
+        }).await.map_err(|_|
+        {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "token storage task failed",
+            )
+        })??;
 
         Ok((prefix, branch))
     }
