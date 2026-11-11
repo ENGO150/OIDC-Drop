@@ -4,11 +4,14 @@ WORKDIR /src
 ENV RUSTFLAGS="-C target-feature=+crt-static"
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked
-RUN readelf -h target/release/oidc-drop && \
-    ! readelf -l target/release/oidc-drop | grep INTERP
+#KEEP STATIC FLAGS OFF HOST PROC-MACROS
+RUN target="$(rustc -vV | sed -n 's/^host: //p')" && \
+    cargo build --release --locked --target "$target" && \
+    cp "target/$target/release/oidc-drop" /src/oidc-drop
+RUN readelf -h /src/oidc-drop && \
+    ! readelf -l /src/oidc-drop | grep INTERP
 
 FROM gcr.io/distroless/static-debian13:nonroot
-COPY --from=build /src/target/release/oidc-drop /usr/local/bin/oidc-drop
+COPY --from=build /src/oidc-drop /usr/local/bin/oidc-drop
 STOPSIGNAL SIGINT
 ENTRYPOINT ["/usr/local/bin/oidc-drop"]
