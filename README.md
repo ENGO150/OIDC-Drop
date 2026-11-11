@@ -394,7 +394,13 @@ cargo audit --deny warnings
 
 
 CI runs strict Clippy, regression tests, a release build, dependency
-auditing, and a container vulnerability scan. Image publishing depends on these
+auditing, and a container vulnerability scan. The image builds a static musl
+binary on Alpine and runs it in a nonroot Distroless static Debian 13 image,
+without glibc, OpenSSL, or C++ runtime packages. Builds pull current base images to include upstream security updates. Container findings are printed as a
+table and retained for 14 days in the `container-vulnerability-report` workflow
+artifact, including when the scan fails. High and Critical findings still block
+publication, including findings without an available fix. A container smoke test
+checks startup, storage access, and HTTPS trust against the GitHub key endpoint. Image publishing depends on these
 checks. Checks also run on pull requests and daily; Dependabot checks Rust,
 GitHub Actions, and Docker dependencies weekly. Test RSA fixtures are generated
 keys used only for local tests; they are not production credentials.

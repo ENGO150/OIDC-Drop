@@ -30,9 +30,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build --tag oidc-drop:ci .
-      - uses: anchore/scan-action@v6
+      - run: docker build --pull --tag oidc-drop:ci .
+      - name: Smoke-test runtime and HTTPS trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name oidc-drop-smoke \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 64 --memory 128m --publish 127.0.0.1::8080 \
+            --tmpfs /data:uid=65532,gid=65532,mode=0700 \
+            --tmpfs /uploads:uid=65532,gid=65532,mode=0700 \
+            --env LISTEN_ADDR=0.0.0.0:8080 --env DATA_DIR=/data --env UPLOAD_DIR=/uploads \
+            --env OIDC_AUDIENCE=oidc-drop --env REPOSITORY_OWNER_ID=1 \
+            --env ASSET_PREFIXES=2=ci --env ALLOWED_VARIANTS=linux-amd64 \
+            --env ALLOWED_SUBS=repo:ci/example:ref:refs/heads/main oidc-drop:ci
+          trap 'docker logs oidc-drop-smoke; docker rm --force oidc-drop-smoke >/dev/null' EXIT
+          endpoint="http://$(docker port oidc-drop-smoke 8080/tcp)"
+          for attempt in {1..30}; do
+            if curl --max-time 2 --silent --fail "$endpoint/healthz" >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --max-time 5 --fail --silent --show-error "$endpoint/readyz"
+          response="$(mktemp)"
+          status="$(curl --max-time 15 --silent --show-error --output "$response" --write-out '%{http_code}' \
+            --request PUT "$endpoint/upload/linux-amd64" \
+            --header 'Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6ImNpLXByb2JlIn0.e30.AA')"
+          cat "$response"
+          test "$status" = 401
+          grep --quiet --line-regexp 'unknown key id' "$response"
+      - name: Scan runtime image
+        id: scan
+        uses: anchore/scan-action@v6
         with:
           image: oidc-drop:ci
           fail-build: true
           severity-cutoff: high
+          only-fixed: false
+          output-format: table
+          output-file: ${{ runner.temp }}/container-scan.txt
+      - name: Preserve vulnerability report
+        if: ${{ always() && steps.scan.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-vulnerability-report
+          path: ${{ runner.temp }}/container-scan.txt
+          if-no-files-found: warn
+          retention-days: 14
