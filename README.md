@@ -61,6 +61,28 @@ to `.env` alone does not override the literal Compose values.
 The current port mapping publishes port 8080 on all host interfaces. When using
 a reverse proxy on the same host, change it to `127.0.0.1:8080:8080`.
 
+## Logging
+
+Logs go to stderr and are visible with `docker compose logs -f oidc-drop`.
+The default level is `info` for this application and `warn` for dependencies.
+Each upload request has a generated request ID, method, route template, response
+status, and elapsed time. Logs include upload stages, progress every 16 MiB,
+chunk acceptance, publication, signing-key refreshes, rejection reasons, cleanup,
+startup limits, and shutdown. Successful health/readiness probes are debug-only.
+Tokens, token IDs, headers, query strings, and request bodies are not logged.
+
+For more detail, add this entry to your Compose `environment` block and recreate
+the container with `docker compose up -d`:
+
+```yaml
+RUST_LOG: "warn,oidc_drop=debug"
+```
+
+Debug adds successful authentication and staging reservation events, plus probe
+requests. Use `RUST_LOG: "warn,oidc_drop=trace"` for all application events. In
+Compose, setting `RUST_LOG` only in `.env` does not pass it into the container;
+add it to `environment`. No logging configuration is required for the default.
+
 ## Storage and downloads
 
 - `./data` holds published files and their `.sha256` sidecars.
@@ -372,7 +394,13 @@ cargo audit --deny warnings
 
 
 CI runs strict Clippy, regression tests, a release build, dependency
-auditing, and a container vulnerability scan. Image publishing depends on these
+auditing, and a container vulnerability scan. The image builds a static musl
+binary on Alpine and runs it in a nonroot Distroless static Debian 13 image,
+without glibc, OpenSSL, or C++ runtime packages. Builds pull current base images to include upstream security updates. Container findings are printed as a
+table and retained for 14 days in the `container-vulnerability-report` workflow
+artifact, including when the scan fails. High and Critical findings still block
+publication, including findings without an available fix. A container smoke test
+checks startup, storage access, and HTTPS trust against the GitHub key endpoint. Image publishing depends on these
 checks. Checks also run on pull requests and daily; Dependabot checks Rust,
 GitHub Actions, and Docker dependencies weekly. Test RSA fixtures are generated
 keys used only for local tests; they are not production credentials.
