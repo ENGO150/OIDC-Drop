@@ -14,7 +14,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install stable Rust
         run: rustup update stable --no-self-update && rustup default stable && rustup component add rustfmt clippy
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -23,13 +23,13 @@ jobs:
   dependencies:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo install cargo-audit --locked
       - run: cargo audit --deny warnings
   container:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build --pull --tag oidc-drop:ci .
       - name: Smoke-test runtime and HTTPS trust
         shell: bash
