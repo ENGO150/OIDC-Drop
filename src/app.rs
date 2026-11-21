@@ -26,6 +26,7 @@ use tokio::
 use axum::http::{ HeaderMap, StatusCode };
 use reqwest::{ Client, Response };
 use serde::Deserialize;
+use tracing::Span;
 use futures_util::StreamExt;
 
 use jsonwebtoken::
@@ -46,6 +47,7 @@ use jsonwebtoken::
 use crate::
 {
     consts,
+    logging,
     config::{ self, Config },
     storage::{ self, Replay, Staging },
 };
@@ -97,7 +99,7 @@ impl App
     pub(crate) fn admit(&self) -> Result<OwnedSemaphorePermit, Fail>
     {
         self.slots.clone().try_acquire_owned()
-            .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "upload capacity reached"))
+            .map_err(|_| logging::reject(StatusCode::SERVICE_UNAVAILABLE, "upload capacity reached"))
     }
 
     pub(crate) fn lock_asset(&self, asset: &str) -> Result<OwnedMutexGuard<()>, Fail>
@@ -105,7 +107,7 @@ impl App
         let mut assets = self.assets.lock().expect("asset lock poisoned");
         assets.retain(|_, lock| Arc::strong_count(lock) > 1);
         assets.entry(asset.to_owned()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
-            .try_lock_owned().map_err(|_| (StatusCode::CONFLICT, "artifact upload busy"))
+            .try_lock_owned().map_err(|_| logging::reject(StatusCode::CONFLICT, "artifact upload busy"))
     }
 
     async fn key_for(&self, kid: &str) -> Result<DecodingKey, Fail>
@@ -121,50 +123,52 @@ impl App
             if keys.fetched.is_some_and(|at| at.elapsed() < consts::JWKS_MIN_REFRESH)
             {
                 return keys.keys.get(kid).cloned()
-                    .ok_or((StatusCode::UNAUTHORIZED, "unknown key id"));
+                    .ok_or_else(|| logging::reject(StatusCode::UNAUTHORIZED, "unknown key id"));
             }
         }
 
         let _refresh = self.refresh.try_lock()
-            .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "issuer keys refreshing"))?;
+            .map_err(|_| logging::reject(StatusCode::SERVICE_UNAVAILABLE, "issuer keys refreshing"))?;
         {
             let mut keys = self.keys.write().await;
             //RECHECK AFTER ACQUIRING REFRESH
             if keys.fetched.is_some_and(|at| at.elapsed() < consts::JWKS_MIN_REFRESH)
             {
                 return keys.keys.get(kid).cloned()
-                    .ok_or((StatusCode::UNAUTHORIZED, "unknown key id"));
+                    .ok_or_else(|| logging::reject(StatusCode::UNAUTHORIZED, "unknown key id"));
             }
 
             if keys.attempted.is_some_and(|at| at.elapsed() < consts::JWKS_FAILURE_BACKOFF)
             {
-                return Err((StatusCode::SERVICE_UNAVAILABLE, "issuer keys unavailable"));
+                return Err(logging::reject(StatusCode::SERVICE_UNAVAILABLE, "issuer keys unavailable"));
             }
 
             keys.attempted = Some(Instant::now());
         }
 
+        tracing::info!("refreshing issuer signing keys");
+
         //REFRESH WITHOUT THE CACHE LOCK
         let response = self.http.get(url).send().await.and_then(Response::error_for_status)
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "cannot reach the issuer"))?;
+            .map_err(|_| logging::reject(StatusCode::BAD_GATEWAY, "cannot reach the issuer"))?;
 
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
 
         while let Some(chunk) = stream.next().await
         {
-            let chunk = chunk.map_err(|_| (StatusCode::BAD_GATEWAY, "cannot read issuer keys"))?;
+            let chunk = chunk.map_err(|_| logging::reject(StatusCode::BAD_GATEWAY, "cannot read issuer keys"))?;
 
             if bytes.len() + chunk.len() > 256 * 1024
             {
-                return Err((StatusCode::BAD_GATEWAY, "issuer key set too large"));
+                return Err(logging::reject(StatusCode::BAD_GATEWAY, "issuer key set too large"));
             }
 
             bytes.extend_from_slice(&chunk);
         }
 
         let set: JwkSet = serde_json::from_slice(&bytes)
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "malformed key set"))?;
+            .map_err(|_| logging::reject(StatusCode::BAD_GATEWAY, "malformed key set"))?;
 
         let fresh: HashMap<_, _> = set.keys.iter()
             .filter(|key|
@@ -181,34 +185,32 @@ impl App
 
         if fresh.is_empty()
         {
-            return Err((StatusCode::BAD_GATEWAY, "empty key set"));
+            return Err(logging::reject(StatusCode::BAD_GATEWAY, "empty key set"));
         }
 
         let mut keys = self.keys.write().await;
         keys.keys = fresh;
         keys.fetched = Some(Instant::now());
-        keys.keys.get(kid).cloned().ok_or((StatusCode::UNAUTHORIZED, "unknown key id"))
+        tracing::info!(keys = keys.keys.len(), "issuer signing keys refreshed");
+        keys.keys.get(kid).cloned().ok_or_else(|| logging::reject(StatusCode::UNAUTHORIZED, "unknown key id"))
     }
 
     pub(crate) async fn authenticate(&self, headers: &HeaderMap) -> Result<(String, String), Fail>
     {
         let token = headers.get("authorization").and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer ")).filter(|token| token.len() <= 16384).ok_or
-            ((
-                StatusCode::UNAUTHORIZED,
-                "missing or oversized bearer token",
-            ))?;
+            .and_then(|v| v.strip_prefix("Bearer ")).filter(|token| token.len() <= 16384)
+            .ok_or_else(|| logging::reject(StatusCode::UNAUTHORIZED, "missing or oversized bearer token"))?;
 
         let header = jsonwebtoken::decode_header(token)
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "bad token"))?;
+            .map_err(|_| logging::reject(StatusCode::UNAUTHORIZED, "bad token"))?;
 
         if header.alg != Algorithm::RS256
         {
-            return Err((StatusCode::UNAUTHORIZED, "unsupported token algorithm"));
+            return Err(logging::reject(StatusCode::UNAUTHORIZED, "unsupported token algorithm"));
         }
 
         let kid = header.kid.filter(|kid| kid.len() <= 256)
-            .ok_or((StatusCode::UNAUTHORIZED, "invalid key id"))?;
+            .ok_or_else(|| logging::reject(StatusCode::UNAUTHORIZED, "invalid key id"))?;
 
         let key = self.key_for(&kid).await?;
 
@@ -220,7 +222,7 @@ impl App
         validation.leeway = consts::CLOCK_LEEWAY;
 
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "token rejected"))?.claims;
+            .map_err(|_| logging::reject(StatusCode::UNAUTHORIZED, "token rejected"))?.claims;
 
         let now = storage::now();
 
@@ -231,38 +233,42 @@ impl App
             || claims.exp - claims.iat > consts::MAX_TOKEN_LIFETIME
             || claims.nbf > claims.exp
         {
-            return Err((StatusCode::UNAUTHORIZED, "invalid token lifetime or ID"));
+            return Err(logging::reject(StatusCode::UNAUTHORIZED, "invalid token lifetime or ID"));
         }
 
         if claims.repository_owner_id != self.config.repository_owner_id
         {
-            return Err((StatusCode::FORBIDDEN, "wrong owner"));
+            return Err(logging::reject(StatusCode::FORBIDDEN, "wrong owner"));
         }
 
         let prefix = self.config.prefixes.get(&claims.repository_id).cloned()
-            .ok_or((StatusCode::FORBIDDEN, "wrong repository"))?;
+            .ok_or_else(|| logging::reject(StatusCode::FORBIDDEN, "wrong repository"))?;
 
         if !self.config.allowed_subs.contains(&claims.sub)
         {
-            return Err((StatusCode::FORBIDDEN, "subject not allowed"));
+            return Err(logging::reject(StatusCode::FORBIDDEN, "subject not allowed"));
         }
 
         let branch = claims.sub.split_once(":ref:refs/heads/").map(|(_, b)| b.to_owned())
             .filter(|b| config::safe_component(b))
-            .ok_or((StatusCode::FORBIDDEN, "unusable branch name"))?;
+            .ok_or_else(|| logging::reject(StatusCode::FORBIDDEN, "unusable branch name"))?;
+
+        tracing::debug!(repository = %claims.repository_id, %prefix, %branch, "token claims authorized");
+
+        let span = Span::current();
 
         let replay = self.replay.clone();
         task::spawn_blocking(move ||
         {
+            let _entered = span.enter();
             replay.lock().expect("replay lock poisoned")
                 .claim(&claims.jti, claims.exp.saturating_add(consts::CLOCK_LEEWAY))
         }).await.map_err(|_|
         {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "token storage task failed",
-            )
+            logging::reject(StatusCode::INTERNAL_SERVER_ERROR, "token storage task failed")
         })??;
+
+        tracing::debug!("authentication completed; token use persisted");
 
         Ok((prefix, branch))
     }

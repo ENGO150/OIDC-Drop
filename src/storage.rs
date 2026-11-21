@@ -19,6 +19,7 @@ use std::
 };
 
 use tokio::task;
+use tracing::Span;
 use axum::http::StatusCode;
 use serde::{ Serialize, Deserialize };
 use sha2::{ Digest, Sha256 };
@@ -26,6 +27,7 @@ use sha2::{ Digest, Sha256 };
 use crate::
 {
     consts,
+    logging,
     app::Fail,
 };
 
@@ -40,8 +42,8 @@ pub(crate) fn now() -> u64
 
 pub(crate) fn disk_error(error: Error) -> Fail
 {
-    eprintln!("storage error: {error}");
-    (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+    tracing::error!(%error, "storage operation failed");
+    logging::reject(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
 }
 
 pub(crate) fn sync_dir(path: &Path) -> IoResult<()>
@@ -81,6 +83,8 @@ impl Replay
             sync_dir(parent)?;
         }
 
+        tracing::info!(records = replay.entries, "replay storage ready");
+
         Ok(replay)
     }
 
@@ -88,6 +92,7 @@ impl Replay
     {
         let now = now();
         self.entries = 0;
+        let mut removed = 0;
 
         for entry in fs::read_dir(&self.root)?
         {
@@ -108,11 +113,17 @@ impl Replay
             if expired
             {
                 fs::remove_file(path)?;
+                removed += 1;
             }
             else
             {
                 self.entries += 1;
             }
+        }
+
+        if removed > 0
+        {
+            tracing::info!(removed, remaining = self.entries, "expired replay records removed");
         }
 
         sync_dir(&self.root)
@@ -122,7 +133,7 @@ impl Replay
     {
         if self.entries >= consts::MAX_REPLAY_ENTRIES
         {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "token replay storage full"));
+            return Err(logging::reject(StatusCode::SERVICE_UNAVAILABLE, "token replay storage full"));
         }
 
         let name = hex::encode(Sha256::digest(jti.as_bytes()));
@@ -132,7 +143,7 @@ impl Replay
             {
                 if e.kind() == ErrorKind::AlreadyExists
                 {
-                    (StatusCode::UNAUTHORIZED, "token already used")
+                    logging::reject(StatusCode::UNAUTHORIZED, "token already used")
                 }
                 else
                 {
@@ -253,6 +264,8 @@ impl Staging
         };
         staging.cleanup()?;
 
+        tracing::info!(sessions = staging.sessions.len(), limit_bytes = limit, max_sessions, "staging storage ready");
+
         Ok(staging)
     }
 
@@ -263,21 +276,25 @@ impl Staging
         size: u64,
     ) -> Result<SessionLease, Fail>
     {
+        let span = Span::current();
+
         let state = shared.clone();
         task::spawn_blocking(move ||
         {
+            let _entered = span.enter();
+
             let mut staging = state.lock().expect("staging lock poisoned");
 
             let existing = staging.sessions.get(&name);
 
             if existing.is_some_and(|s| s.active)
             {
-                return Err((StatusCode::CONFLICT, "upload busy"));
+                return Err(logging::reject(StatusCode::CONFLICT, "upload busy"));
             }
 
             if existing.is_some_and(|s| s.declared != 0 && s.declared != size)
             {
-                return Err((StatusCode::CONFLICT, "upload size changed"));
+                return Err(logging::reject(StatusCode::CONFLICT, "upload size changed"));
             }
 
             let old_size = existing.map_or(0, |s| s.size);
@@ -289,7 +306,7 @@ impl Staging
             if used.saturating_sub(old_size).saturating_add(reserved) > staging.limit
                 || (existing.is_none() && staging.sessions.len() >= staging.max_sessions)
             {
-                return Err((StatusCode::INSUFFICIENT_STORAGE, "staging quota exceeded"));
+                return Err(logging::reject(StatusCode::INSUFFICIENT_STORAGE, "staging quota exceeded"));
             }
 
             let path = staging.root.join(&name);
@@ -314,6 +331,7 @@ impl Staging
             sync_dir(&path).map_err(disk_error)?;
             sync_dir(&staging.root).map_err(disk_error)?;
             staging.sessions.insert(name.clone(), session);
+            tracing::debug!(session = %name, reserved_bytes = reserved, "staging reservation persisted");
 
             Ok(SessionLease
             {
@@ -321,7 +339,7 @@ impl Staging
                 name,
                 path,
             })
-        }).await.map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "storage task failed"))?
+        }).await.map_err(|_| logging::reject(StatusCode::INTERNAL_SERVER_ERROR, "storage task failed"))?
     }
 
     pub(crate) fn remove(&mut self, name: &str) -> IoResult<()>
@@ -348,6 +366,7 @@ impl Staging
         for name in expired
         {
             self.remove(&name)?;
+            tracing::info!(session = %name, "expired staging session removed");
         }
 
         Ok(())
@@ -377,16 +396,14 @@ pub(crate) fn available_bytes(path: &Path) -> IoResult<u64>
 pub(crate) async fn ensure_space(path: PathBuf, required: u64) -> Result<(), Fail>
 {
     let available = task::spawn_blocking(move || available_bytes(&path)).await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "disk check task failed"))?
+        .map_err(|_| logging::reject(StatusCode::INTERNAL_SERVER_ERROR, "disk check task failed"))?
         .map_err(disk_error)?;
 
     if available < required
     {
+        tracing::warn!(available_bytes = available, required_bytes = required, "disk space check failed");
         return Err
-        ((
-            StatusCode::INSUFFICIENT_STORAGE,
-            "insufficient free disk space",
-        ));
+        (logging::reject(StatusCode::INSUFFICIENT_STORAGE, "insufficient free disk space"));
     }
 
     Ok(())
