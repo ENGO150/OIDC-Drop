@@ -60,7 +60,7 @@ jobs:
           grep --quiet --line-regexp 'unknown key id' "$response"
       - name: Scan runtime image
         id: scan
-        uses: anchore/scan-action@v6
+        uses: anchore/scan-action@v7
         with:
           image: oidc-drop:ci
           fail-build: true
