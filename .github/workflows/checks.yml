@@ -70,7 +70,7 @@ jobs:
           output-file: ${{ runner.temp }}/container-scan.txt
       - name: Preserve vulnerability report
         if: ${{ always() && steps.scan.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: container-vulnerability-report
           path: ${{ runner.temp }}/container-scan.txt
